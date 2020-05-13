@@ -1,1 +1,210 @@
+### SNS questionnaire
+
+https://twitter.com/dajhiroki/status/1253588554103402498
+https://twitter.com/dajhiroki/status/1250938192334815234
+https://twitter.com/dajhiroki/status/1248448870377373697
+https://twitter.com/dajhiroki/status/1246946140630552576
+https://twitter.com/dajhiroki/status/1243327743040745472
+https://twitter.com/dajhiroki/status/1240772960924794880
+https://twitter.com/dajhiroki/status/1238299708059074562
+https://twitter.com/dajhiroki/status/1256384655458107394
+
+###
+
+### analysis
+qdate <- c("03-13", "03-20", "03-27", "04-06", "04-10", "04-17", "04-27", "05-02")
+dat <- rbind(
+            c(89.3, 5.4, 3.6, 1.8),
+            c(76.6, 17, 2.1, 4.3),
+            c(82.2, 6.8, 4.1, 6.8),
+            c(64.4, 23.1, 6.9, 5.6),
+            c(45.7, 38.5, 13.1, 2.7),
+            c(26.7, 37.5, 26.7, 9.1),
+            c(24.7, 37.8, 29.5, 8),
+            c(28.8, 40.2, 23.4, 7.6)
+            )/100
+dat <- dat/rowSums(dat)
+colnames(dat) <- c("通常通り", "少し制限（半分以上）", "大きく制限（半分以下）", "原則予定手術なし") # Japanese
+colnames(dat) <- c("No surgical restrictions", "Partial restrictions", "Extensive restrictions", "No scheduled surgery")
+# colnames(dat) <- c("No surgical restrictions", "Partial restrictions\n(more than half of the usual)", "Extensive restrictions\n(less than half of the usual)", "No scheduled surgery")
+
+N <- c(113, 47, 73, 160, 221, 232, 288, 184)
+datN <- round(dat * N)
+
+GA <- read.csv("generalanesth.csv")
+GAN <- na.omit(head(GA$GA, -5))
+GAN12 <- round(GAN[GAN > 100]/12)
+
+# mean of beta distribution
+me <- c(0.7, 0.4, 0.1)
+# me <- c(0.8, 0.5, 0.25) # optimistic
+# me <- c(0.5, 0.3, 0.03) # pessimistic
+
+# variance of beta distribution
+v <- 0.005
+b <- cbind(me^2*(1-me)/v-me, (1-me)*(me*(1-me)/v-1))
+x <- seq(0, 1.051, length=300)
+d <- mapply(function(z) dbeta(x, b[z, 1], b[z, 2]), seq(me))
+d <- cbind(dunif(x, 0.95, 1.05), d)
+
+library(vioplot)
+library(rstan)
+rstan_options(auto_write=TRUE)
+options(mc.cores=parallel::detectCores())
+
+# estimation
+code <- "
+data{
+  int<lower=1> T;                   // Number of time
+  int<lower=0> Tf;                  // Number of future time
+  matrix<lower=0, upper=1>[T, 4] M; // proportion of answers
+  int<lower=0> N_hospital;          // Number of hospitals performing geenral anesthesia
+  int<lower=0> Ope[N_hospital];     // Number of GAs
+  int<lower=0> N[T, 4];             // Number of questionaires
+  matrix<lower=0>[3, 2] b;          // beta distribution paramters
+}
+parameters {
+  real<lower=0, upper=1> g[3];
+}
+transformed parameters{
+  simplex[4] y[T+Tf];
+  y[1] = to_vector(M[1, ]);
+  for(i in 1:(T+Tf-1)){
+   y[i+1][1] = y[i][1] + -g[1]*y[i][1];
+   y[i+1][2] = y[i][2] +  g[1]*y[i][1] - g[2]*y[i][2];
+   y[i+1][3] = y[i][3] +  g[2]*y[i][2] - g[3]*y[i][3];
+   y[i+1][4] = y[i][4] +  g[3]*y[i][3];
+  }
+}
+model {
+  for(i in 1:T){
+    to_vector(M[i,]) ~ dirichlet(y[i]);
+    N[i,] ~ multinomial(y[i]);
+  }
+}
+generated quantities{
+  matrix<lower=0>[T+Tf, N_hospital] R;  // Estimated number of GAs for each hospital
+  int<lower=0> hoge;
+  for(i in 1:N_hospital){
+    for(t in 1:(T+Tf)){
+      if(t == 1){
+        hoge = categorical_rng(y[t]);   // First category
+      } else {
+        if(hoge < 4){
+          hoge = hoge + bernoulli_rng(g[hoge]); // transition
+        }
+      }
+      if(hoge == 1){
+        R[t, i] = round(Ope[i] * uniform_rng(0.95, 1.05)); // first category
+      } else {
+        R[t, i] = binomial_rng(Ope[i], beta_rng(b[hoge-1, 1], b[hoge-1, 2])); // 2nd-4th category
+      }
+    }
+  }
+}
+"
+
+
+m0 <- stan_model(model_code=code)
+standata <- list(T=nrow(dat), Tf=24, M=dat, N_hospital=length(GAN12), Ope=GAN12, N=datN, b=b)
+fit <- sampling(m0, standata, iter=700, warmup=300, chain=4)
+ex <- extract(fit, pars=head(fit@model_pars, -1))
+
+alpha <- 0.05
+cia <- c(alpha/2, 0.5, 1-alpha/2)
+m <- abind::abind(mapply(function(z) apply(ex$y[,,z], 2, quantile, cia), seq(4), SIMPLIFY=FALSE), along=3)
+
+# the number of general anesthesia (10^4 / week unit)
+Z <- as.data.frame(t(mapply(function(z) rowSums(ex$R[z,,]), seq(dim(ex$R)[1]))))
+div <- 1/10000
+Z <- Z/4*div
+Zcia <- apply(Z, 2, quantile, cia)
+
+cols256 <- list("green", "yellow", "orange", "red")
+cols256 <- lapply(lapply(cols256, col2rgb), c)
+cols <- mapply(function(z) rgb(z[1], z[2], z[3], maxColorValue=256), cols256)
+colsa <- mapply(function(z) rgb(z[1], z[2], z[3], 20, maxColorValue=256), cols256)
+
+# svg("fig01.svg", 7, 5)
+par(mar=c(5, 5, 2, 2), las=1, cex.lab=1.5, cex.axis=1.5)
+matplot(x*100, d, type="l", lwd=3, lty=1, xlab="Restriction of General Anesthesia [%]", ylab="Density", col=cols)
+#legend(par()$usr[1], par()$usr[4], legend=sprintf("%s (%d%s)", colnames(dat), c(1, me)*100, "%"), ncol=1, col=cols, pch=15, cex=1.5, xpd=TRUE, bty="n")
+legend("top", legend=sprintf("%s (%d%s)", colnames(dat), c(1, me)*100, "%"), ncol=1, col=cols, pch=15, cex=1.5, xpd=TRUE, bty="n")
+# dev.off()
+
+library(igraph)
+G <- graph_from_adjacency_matrix(matrix(c(0,1,0,0,0,0,1,0,0,0,0,1,0,0,0,0), nc=4, byrow=TRUE))
+lmat <- cbind(1:4, 1)
+V(G)$label.cex <- 3
+V(G)$label.font <- 2
+V(G)$label.color <- "black"
+V(G)$size <- 20
+V(G)$color <- cols
+E(G)$color <- "black"
+E(G)$width <- 3
+# svg("fig02.svg", 48/9, 12/9)
+par(mar=c(0, 0, 0, 0))
+plot(G, layout=lmat, ylim=c(-1, -1))
+for(i in 1:3){
+  txt <- as.expression(substitute(italic(g[x%->%~y]), list(x=i, y=i+1)))
+  text(mean(layout.norm(lmat)[c(i, i+1), 1]), -1, txt, pos=3, cex=2)
+}
+# dev.off()
+
+yl <- c(0, 1)
+# svg("fig03b.svg", width=10, height=5)
+par(mar=c(5, 5, 2, 2), cex.lab=1.2, las=1)
+matplot(m[2,,], type="n", col=colsa, lty=1, lwd=3, ylim=yl, xaxt="n", xlab="Week", ylab="Proportion of queationnaire", cex.axis=1.5)
+axis(1, at=seq(qdate), labels=gsub("-", "/", qdate), las=2, cex.axis=1)
+axis(1, at=(length(qdate)+1):dim(m)[2], labels=1:(dim(m)[2]-length(qdate)), cex.axis=0.7)
+legend(length(qdate), 0.6, legend=colnames(dat), ncol=1, col=cols, pch=15, yjust=-0.1, xpd=TRUE, bty="n", cex=1.4)
+for(i in seq(dim(m)[3])){
+  lines(c(seq(dim(m)[2])), m[2,,i], col=cols[i], lwd=4)
+  polygon(c(c(seq(dim(m)[2])), rev(c(seq(dim(m)[2])))), c(m[1,,i], rev(m[3,,i])), col=colsa[i], border=NA)
+  points(seq(N), dat[,i], col=cols[i], pch=16)
+}
+# dev.off()
+
+# svg("fig03a.svg")
+plot(c(0.5, 3.5), c(0, 0.3), type="n", ylim=c(0, 0.25), xaxt="n", xlab="", ylab="Probability")
+axis(1, at=1, labels=as.expression(substitute(italic(g)[1%->%2])), cex.axis=2)
+axis(1, at=2, labels=as.expression(substitute(italic(g)[2%->%3])))
+axis(1, at=3, labels=as.expression(substitute(italic(g)[3%->%4])))
+vioplot(as.data.frame(ex$g), add=TRUE, colMed=NA)
+# dev.off()
+
+#par(mfrow=c(2, 1))
+# svg("fig04.svg", width=10, height=5)
+par(mar=c(5, 5, 2, 2), cex.lab=1.2, cex.axis=2, las=1)
+plot(c(1.2, ncol(Z)-0.2), c(0, 1), type="n", xaxt="n", ylim=c(0, max(Z)),
+     xlab="Week", ylab=as.expression(substitute("Number of General Anesthesia ["*10^4*"/week]")))
+#axis(1, at=seq(ncol(Z)), labels=c(gsub("-", "/", qdate), 1:(ncol(Z)-length(qdate))), cex.axis=0.8, las=1)
+axis(1, at=seq(qdate), labels=gsub("-", "/", qdate), cex.axis=1, las=2)
+axis(1, at=(length(qdate)+1):ncol(Z), labels=1:(ncol(Z)-length(qdate)), cex.axis=0.7, las=1)
+vioplot(Z, add=TRUE, col=cols[replace(rep(2, ncol(Z)), seq(qdate), 1)], colMed=NA)
+#text(seq(ncol(Z)), apply(Z, 2, min), sprintf("%.1f%s", colMeans(Z)/colMeans(Z)[1]*100, "%"), pos=1, cex=0.9, srt=30)
+#abline(v=length(qdate)+0.5, lty=3)
+# dev.off()
+
+# results of three scenarios
+types <- c("optimistic", "estimate", "pessimistic")
+Zs <- mapply(function(z) read.csv(sprintf("%s.csv", z), row=1), types, SIMPLIFY=FALSE)
+
+xd <- 0.1*c(-1:1)
+zcols <- c("blue", "green", "red")
+# svg("fig05.svg", width=10, height=5)
+par(mar=c(5, 5, 2, 2), cex.lab=1.2, cex.axis=2, las=1)
+plot(c(1.2, ncol(Z)-0.2), c(0, 1), type="n", xaxt="n", ylim=c(0, max(Z)),
+     xlab="Week", ylab=as.expression(substitute("Number of General Anesthesia ["*10^4*"/week]")))
+#axis(1, at=seq(ncol(Z)), labels=c(gsub("-", "/", qdate), 1:(ncol(Z)-length(qdate))), cex.axis=0.8, las=1)
+axis(1, at=seq(qdate), labels=gsub("-", "/", qdate), cex.axis=1, las=2)
+axis(1, at=(length(qdate)+1):ncol(Z), labels=1:(ncol(Z)-length(qdate)), cex.axis=0.7, las=1)
+for(i in seq(Zs)){
+  for(j in 1:ncol(Zs[[i]])){
+    segments(j+xd[i], Zs[[i]][1,j], y1=Zs[[i]][3,j], col=zcols[i], lwd=3)
+    points(j+xd[i], Zs[[i]][2,j], pch=16, col=zcols[i])
+  }
+}
+legend("topright", legend=types, pch=15, col=zcols, cex=2)
+# dev.off()
 
